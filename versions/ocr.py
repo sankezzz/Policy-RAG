@@ -2,6 +2,10 @@ import streamlit as st
 import os
 import tempfile
 import sys
+import numpy as np # Needed for image processing
+from PIL import Image # Needed to open images
+import easyocr # The OCR library
+
 from huggingface_hub import hf_hub_download
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -18,25 +22,18 @@ from googletrans import Translator
 
 # --- FIX for HuggingFace 401 Error ---
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "true"
-# -------------------------------------
 
 # --- CONFIGURATION ---
-# 1. Embedding Model (runs on GPU)
 EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B" 
-# 2. LLM Model (runs on CPU)
 LLM_REPO_ID = "microsoft/Phi-3-mini-4k-instruct-gguf"
-LLM_FILE_NAME = "Phi-3-mini-4k-instruct-q4.gguf" # The ~2.4GB file
+LLM_FILE_NAME = "Phi-3-mini-4k-instruct-q4.gguf" 
 LOCAL_LLM_PATH = f"./{LLM_FILE_NAME}"
-# ---------------------
 
-# --- HELPER FUNCTIONS (No changes here) ---
+# --- HELPER FUNCTIONS ---
 
 def download_llm_model():
-    """
-    Downloads the Phi-3 GGUF model file if it doesn't exist.
-    """
     if os.path.exists(LOCAL_LLM_PATH):
-        return # Model already exists
+        return 
     st.info(f"Downloading {LLM_FILE_NAME} (~2.4GB)... This may take a few minutes.")
     try:
         hf_hub_download(
@@ -52,51 +49,63 @@ def download_llm_model():
 
 @st.cache_resource
 def get_embeddings_model():
-    """Loads the embedding model from HuggingFace, configured for CUDA."""
     print("Loading embedding model (for CUDA)...")
     try:
         embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cuda'}  # <-- Use CUDA
+            model_kwargs={'device': 'cuda'} 
         )
-        embeddings.embed_query("Test embedding")
-        print("Embedding model loaded to CUDA successfully.")
         return embeddings
     except Exception as e:
-        st.error(f"Error loading embedding model '{EMBEDDING_MODEL_NAME}': {e}")
-        st.error("Please ensure 'transformers' is up to date: pip install --upgrade transformers")
+        st.error(f"Error loading embedding model: {e}")
         st.stop()
         
 @st.cache_resource
 def get_llm():
-    """Initializes the LlamaCpp LLM to run locally on CPU."""
     if not os.path.exists(LOCAL_LLM_PATH):
         st.error(f"LLM file not found: {LOCAL_LLM_PATH}")
-        st.error("Please restart the app to trigger the download.")
         st.stop()
-    print("Loading LlamaCpp model (for CPU)...")
     try:
         llm = LlamaCpp(
             model_path=LOCAL_LLM_PATH,
-            n_gpu_layers=0,  # <-- 0 = RUN ON CPU (SYSTEM MEMORY)
+            n_gpu_layers=0, 
             n_batch=512,
             n_ctx=4096,
             temperature=0.1,
             verbose=True,
         )
-        llm.invoke("Hello") # Simple check
-        print("LlamaCpp model loaded successfully.")
     except Exception as e:
         st.error(f"Error loading LlamaCpp model: {e}")
         st.stop()
     return llm
 
+# --- NEW: OCR Helper Function ---
+@st.cache_resource
+def get_ocr_reader():
+    """
+    Initializes EasyOCR.
+    We load English ('en'), Hindi ('hi'), and Marathi ('mr') 
+    to match your app's language capabilities.
+    gpu=True ensures it uses CUDA if available.
+    """
+    print("Loading EasyOCR Reader...")
+    # Note: The first time this runs, it will download the OCR models (~20MB)
+    return easyocr.Reader(['en', 'hi', 'mr'], gpu=True) 
+
+def extract_text_from_image(image_path):
+    """
+    Reads an image file and returns the extracted text string.
+    """
+    reader = get_ocr_reader()
+    # EasyOCR expects a numpy array or file path
+    result = reader.readtext(image_path, detail=0, paragraph=True)
+    # Result is a list of strings, join them
+    return "\n\n".join(result)
+
 def format_docs(docs: list[Document]) -> str:
-    """Helper function to format retrieved docs into a single string."""
     return "\n\n---\n\n".join(doc.page_content for doc in docs)
 
 def get_rag_chain(vector_store, llm):
-    """Creates the complete RAG (Retrieval-Augmented Generation) chain."""
     retriever = vector_store.as_retriever(
         search_type="similarity",
         search_kwargs={'k': 3} 
@@ -104,10 +113,9 @@ def get_rag_chain(vector_store, llm):
     template_str = """
 <|system|>
 You are an expert fraud analyst and policy advisor.
-Your task is to meticulously analyze the provided policy context to find potential loopholes, ambiguities, or clauses that could be exploited.
+Your task is to analyze the provided policy context (which may include OCR text from images) to find potential loopholes.
 Based *only* on the following context, answer the user's query.
-If the context does not contain the answer, state that clearly.
-Do not use any outside knowledge.<|end|>
+<|end|>
 <|user|>
 CONTEXT:
 {context}
@@ -128,23 +136,19 @@ ANALYSIS:
 
 # --- STREAMLIT APP ---
 
-st.set_page_config(page_title="Policy Analyzer (Multilingual)", layout="wide")
+st.set_page_config(page_title="Policy Analyzer (Multilingual + OCR)", layout="wide")
 st.title("📄 RAG Policy Analyzer")
-st.markdown(f"**LLM:** `Phi-3-Mini` (on CPU) | **Embeddings:** `{EMBEDDING_MODEL_NAME}` (on GPU)")
-st.markdown("तुम्ही मराठी, हिंदी किंवा English प्रश्न विचारू शकता. (You can ask questions in Marathi, Hindi, or English.)")
+st.markdown(f"**LLM:** `Phi-3-Mini` (CPU) | **Embeddings:** `{EMBEDDING_MODEL_NAME}` (GPU) | **OCR:** `EasyOCR`")
+st.markdown("Supports PDF, TXT, MD, and Images (JPG/PNG). Questions in Marathi, Hindi, or English.")
 
-# --- Download Model at Start ---
 download_llm_model()
 
-# --- Initialize Translator ---
-# This needs an internet connection to work
 try:
     translator = Translator()
 except Exception as e:
-    st.error(f"Could not initialize translator. Do you have an internet connection? {e}")
+    st.error(f"Translator Error: {e}")
     st.stop()
 
-# --- Initialize session state ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "vector_store" not in st.session_state:
@@ -153,97 +157,110 @@ if "vector_store" not in st.session_state:
 # --- Sidebar for Document Upload ---
 with st.sidebar:
     st.header("1. Upload Documents")
-    st.caption("Upload .txt, .md, or .pdf files. The vector store will be updated.")
+    st.caption("Upload files. Images will be processed via OCR.")
     
+    # ADDED: jpg, jpeg, png to the file types
     uploaded_files = st.file_uploader(
-        "Upload your policy documents",
-        type=["pdf", "txt", "md"],
+        "Upload policy documents",
+        type=["pdf", "txt", "md", "jpg", "jpeg", "png"],
         accept_multiple_files=True
     )
 
     if uploaded_files:
         if st.button("Process Documents"):
-            with st.spinner("Processing documents... (Using GPU for embeddings)"):
-                # (No changes in this section)
+            with st.spinner("Processing... (Reading PDFs & OCRing Images)"):
                 all_chunks = []
                 with tempfile.TemporaryDirectory() as temp_dir:
                     for uploaded_file in uploaded_files:
                         file_path = os.path.join(temp_dir, uploaded_file.name)
+                        
+                        # Write file to temp
                         with open(file_path, "wb") as f:
                             f.write(uploaded_file.getvalue())
-                        loader = None
-                        if uploaded_file.name.endswith(".pdf"):
-                            loader = PyPDFLoader(file_path)
-                        elif uploaded_file.name.endswith((".txt", ".md")):
-                            loader = TextLoader(file_path, encoding="utf-8")
-                        if loader:
-                            try:
-                                docs = loader.load()
+                        
+                        documents = [] # List to hold LangChain Documents
+                        
+                        # --- Logic to handle different file types ---
+                        try:
+                            if uploaded_file.name.lower().endswith(".pdf"):
+                                loader = PyPDFLoader(file_path)
+                                documents = loader.load()
+                                
+                            elif uploaded_file.name.lower().endswith((".txt", ".md")):
+                                loader = TextLoader(file_path, encoding="utf-8")
+                                documents = loader.load()
+                                
+                            elif uploaded_file.name.lower().endswith((".jpg", ".jpeg", ".png")):
+                                # NEW: Handle Images
+                                extracted_text = extract_text_from_image(file_path)
+                                if extracted_text.strip():
+                                    # Create a LangChain Document manually
+                                    doc = Document(
+                                        page_content=extracted_text,
+                                        metadata={"source": uploaded_file.name}
+                                    )
+                                    documents = [doc]
+                                else:
+                                    st.warning(f"No text found in image: {uploaded_file.name}")
+                            
+                            # --- Split and Accumulate ---
+                            if documents:
                                 text_splitter = RecursiveCharacterTextSplitter(
                                     chunk_size=1000,
                                     chunk_overlap=150
                                 )
-                                chunks = text_splitter.split_documents(docs)
+                                chunks = text_splitter.split_documents(documents)
                                 all_chunks.extend(chunks)
-                            except Exception as e:
-                                st.error(f"Error loading {uploaded_file.name}: {e}")
+                                
+                        except Exception as e:
+                            st.error(f"Error processing {uploaded_file.name}: {e}")
+
+                # --- Create Vector Store ---
                 if all_chunks:
                     embeddings = get_embeddings_model()
                     vector_store = FAISS.from_documents(all_chunks, embeddings)
                     st.session_state.vector_store = vector_store
-                    st.success(f"Processed {len(all_chunks)} chunks. Ready to chat!")
+                    st.success(f"Processed {len(all_chunks)} chunks from {len(uploaded_files)} files.")
                 else:
-                    st.error("No processable documents were found.")
+                    st.error("No valid text could be extracted.")
 
     st.header("2. Chat")
-    st.caption("Ask questions about your uploaded documents.")
-    if st.button("Clear Chat History"):
+    if st.button("Clear Chat"):
         st.session_state.messages = []
         st.rerun()
 
-# --- Main Chat Interface (THIS SECTION IS UPDATED) ---
-
-# Display chat messages from history
+# --- Chat Interface (Same as before) ---
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# React to user input
-if prompt := st.chat_input("Ask about your policy... (मराठी/हिंदीत विचारा)"):
+if prompt := st.chat_input("Ask about your policies..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Check if documents are processed
     if st.session_state.vector_store is None:
-        st.warning("Please upload and process your documents in the sidebar before chatting.")
+        st.warning("Please upload and process documents first.")
     else:
-        # Generate and display assistant response
         with st.chat_message("assistant"):
-            with st.spinner("Analyzing... (Thinking in English, translating...)"):
+            with st.spinner("Analyzing..."):
                 try:
-                    # 1. Detect and translate query TO English
                     detected_lang = translator.detect(prompt).lang
                     if detected_lang not in ['en', 'en-US']:
-                        st.caption(f"Detected {detected_lang}, translating to English...")
                         translated_query = translator.translate(prompt, src=detected_lang, dest='en').text
                     else:
                         translated_query = prompt
 
-                    # 2. Run the RAG chain in English
                     llm = get_llm()
                     rag_chain = get_rag_chain(st.session_state.vector_store, llm)
                     response_en = rag_chain.invoke(translated_query)
                     
-                    # 3. Translate the English response BACK to the original language
                     if detected_lang not in ['en', 'en-US']:
-                        st.caption(f"Translating response back to {detected_lang}...")
                         final_response = translator.translate(response_en, src='en', dest=detected_lang).text
                     else:
                         final_response = response_en
                     
                     st.markdown(final_response)
                     st.session_state.messages.append({"role": "assistant", "content": final_response})
-                
                 except Exception as e:
-                    st.error(f"An error occurred during analysis: {e}")
+                    st.error(f"Error: {e}")
